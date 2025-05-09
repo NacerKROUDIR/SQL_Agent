@@ -33,10 +33,8 @@ class DatabaseManager:
         if not query:
             return ""
             
-        # Debug print (only if not silent)
-        if not silent:
-            st.write("DatabaseManager received query:", query)
-            
+        # Debug print - removed for all operations
+        
         # Remove markdown code block syntax
         query = re.sub(r'```sql\s*', '', query)
         query = re.sub(r'```\s*$', '', query)
@@ -47,9 +45,42 @@ class DatabaseManager:
         # Remove any leading/trailing semicolons
         query = re.sub(r'^;+|;+$', '', query)
         
-        # Debug print (only if not silent)
-        if not silent:
-            st.write("DatabaseManager cleaned query:", query)
+        # Handle unbalanced quotes that might cause SQL errors
+        single_quotes = query.count("'")
+        double_quotes = query.count('"')
+        
+        # More robust handling of unbalanced quotes
+        if single_quotes % 2 != 0:
+            # Don't output warnings, just fix silently
+            # Try to find unclosed single quote and balance it
+            in_quote = False
+            balanced_query = ""
+            for char in query:
+                if char == "'":
+                    in_quote = not in_quote
+                balanced_query += char
+            
+            # If we're still in a quote at the end, add a closing quote
+            if in_quote:
+                balanced_query += "'"
+            query = balanced_query
+        
+        if double_quotes % 2 != 0:
+            # Don't output warnings, just fix silently
+            # Try to find unclosed double quote and balance it
+            in_quote = False
+            balanced_query = ""
+            for char in query:
+                if char == '"':
+                    in_quote = not in_quote
+                balanced_query += char
+            
+            # If we're still in a quote at the end, add a closing quote
+            if in_quote:
+                balanced_query += '"'
+            query = balanced_query
+        
+        # Debug print - removed for all operations
         
         return query.strip()
 
@@ -69,18 +100,45 @@ class DatabaseManager:
                     st.error("Query is empty after cleaning")
                 return None
                 
-            # Debug print (only if not silent)
-            if not silent:
-                st.write("Executing query:", cleaned_query)
+            # Debug print - removed for all operations
                 
             with self.engine.connect() as connection:
-                result = connection.execute(text(cleaned_query))
-                return pd.DataFrame(result.fetchall(), columns=result.keys())
+                try:
+                    result = connection.execute(text(cleaned_query))
+                    df = pd.DataFrame(result.fetchall(), columns=result.keys())
+                    
+                    # Debug output moved to debug_info in DatabaseService
+                    return df
+                except Exception as e:
+                    # Provide more detailed error message
+                    if not silent:
+                        st.error(f"SQL execution error: {str(e)}")
+                        if "syntax error" in str(e).lower():
+                            st.error(f"Syntax error in query: {cleaned_query}")
+                    
+                    # Store the error in the session state for reference
+                    if hasattr(st, 'session_state'):
+                        st.session_state.last_sql_error = str(e)
+                    
+                    # Instead of just raising the exception, return a special DataFrame with error information
+                    error_df = pd.DataFrame()
+                    error_df.attrs['error'] = str(e)  # Store error in DataFrame attributes
+                    error_df.attrs['is_error'] = True
+                    return error_df
         except Exception as e:
             if not silent:
                 st.error(f"Error executing query: {str(e)}")
                 st.write("Query that caused error:", query)
-            return None
+            
+            # Store the error in the session state for reference
+            if hasattr(st, 'session_state'):
+                st.session_state.last_sql_error = str(e)
+                
+            # Return a DataFrame with error information
+            error_df = pd.DataFrame()
+            error_df.attrs['error'] = str(e)
+            error_df.attrs['is_error'] = True
+            return error_df
 
     def get_db(self):
         """Get the LangChain SQLDatabase instance."""

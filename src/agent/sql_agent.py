@@ -3,15 +3,23 @@ from langchain_community.chat_models import ChatOpenAI
 from langchain.agents import Tool, AgentExecutor, create_react_agent
 from langchain.prompts import PromptTemplate
 from langchain.schema import AgentAction, AgentFinish
+from langchain.chains import LLMChain
 import streamlit as st
 from typing import Optional, Dict, Any, List, Union
 import re
 
+class MyChatOpenAI(ChatOpenAI):
+    def _generate(self, *args, **kwargs):
+        res = super()._generate(*args, **kwargs)
+        res.generations[0].text = res.generations[0].text.strip("'")
+        return res
+    
 class SQLAgent:
     def __init__(self):
         self.llm = None
         self.agent_executor = None
         self.db_manager = None
+        self.sql_chain = None
 
     def initialize_llm(self, model_name: str, model_type: str, api_key: Optional[str] = None) -> bool:
         """Initialize LLM with selected model."""
@@ -39,7 +47,7 @@ class SQLAgent:
                     response = client.models.list()
                     
                     # If we get here, the API key is valid
-                    self.llm = ChatOpenAI(
+                    self.llm = MyChatOpenAI(
                         model_name=model_name,
                         temperature=0.7,
                         openai_api_key=api_key
@@ -61,24 +69,54 @@ class SQLAgent:
             return False
 
     def clean_sql_query(self, query: str) -> str:
-        """Clean the SQL query by removing markdown code block syntax."""
+        """Clean the SQL query by removing markdown code block syntax and other problematic characters."""
         if not query:
             return ""
             
         # Remove markdown code block syntax
         query = re.sub(r'```sql\s*', '', query)
         query = re.sub(r'```\s*$', '', query)
+        
         # Remove any remaining backticks
         query = re.sub(r'`', '', query)
+        
         # Remove any leading/trailing whitespace and newlines
         query = query.strip()
-        # Remove any leading/trailing semicolons
-        query = re.sub(r'^;+|;+$', '', query)
         
+        # Remove any leading/trailing semicolons
+        # query = re.sub(r'^;+|;+$', '', query)
+        
+        # Handle escaped quotes
+        # query = query.replace('\\"', '"')
+        
+        # Handle unbalanced quotes that might cause SQL errors
+        # Count single and double quotes
+        """
+        single_quotes = query.count("'")
+        double_quotes = query.count('"')
+        
+        # If there's an odd number of quotes, remove the last one
+        if single_quotes % 2 != 0 and query.endswith("'"):
+            query = query[:-1]
+        if double_quotes % 2 != 0 and query.endswith('"'):
+            query = query[:-1]
+        """
+            
         return query.strip()
 
     def execute_sql_tool(self, query: str) -> str:
-        """Tool for executing SQL queries."""
+        """Tool for executing SQL queries.
+        
+        Args:
+            query (str): The SQL query to execute. Should be a raw SQL query without any surrounding quotes.
+                For example: SELECT * FROM table_name
+                Not: ```sql SELECT * FROM table_name``` or "SELECT * FROM table_name"
+        
+        Returns:
+            str: The query results as a string, or an error message if execution failed.
+        """
+        print("#"*100)
+        print(query)
         if not self.db_manager:
             return "Error: Database manager not initialized"
             
@@ -87,66 +125,72 @@ class SQLAgent:
             return "Error: Please provide a valid SQL query. Example: SELECT * FROM table_name"
             
         # Clean the query
-        cleaned_query = self.clean_sql_query(query)
-        if not cleaned_query:
-            return "Error: Empty query after cleaning"
+        query = self.clean_sql_query(query)
+        
+        # Use DatabaseService with debug mode enabled for agent operations
+        from src.database.db_service import DatabaseService
+        
+        result = DatabaseService.direct_execute_query(self.db_manager, query, debug_mode=True)
+        
+        if not result:
+            return "Error executing query or no results returned"
+        
+        # Check if there was an SQL error
+        if "is_error" in result and result["is_error"]:
+            # Return the detailed error message to help the agent understand what went wrong
+            error_message = result["answer"]
             
-        # Execute the query
-        try:
-            # Always show debug info for agent tools
-            df = self.db_manager.execute_query(cleaned_query, silent=False)
-            if df is None:
-                return "Error executing query or no results returned"
+            # Store query information for tracking
+            st.session_state.last_query = result["sql"]
+            st.session_state.last_query_error = error_message
             
-            # Store the result in session state for later use
-            st.session_state.last_query = cleaned_query
-            st.session_state.last_query_result = df
+            return f"Error: {error_message}"
             
-            # Convert result to string for agent
-            result_str = df.to_string(index=False)
-            if len(result_str) > 2000:
-                result_str = result_str[:2000] + "\n... [truncated, showing first 2000 characters]"
-                
-            return result_str
-        except Exception as e:
-            return f"Error executing SQL query: {str(e)}"
+        # Store query information for tracking
+        st.session_state.last_query = result["sql"]
+        
+        if result["result_df"] is None or result["result_df"].empty:
+            return "Query executed successfully but returned no results"
             
+        # Store the result in session state for later use
+        st.session_state.last_query_result = result["result_df"]
+        
+        # Convert result to string for agent
+        result_str = result["result_df"].to_string(index=False)
+        if len(result_str) > 2000:
+            result_str = result_str[:2000] + "\n... [truncated, showing first 2000 characters]"
+            
+        return result_str
+
     def get_schema_tool(self, _="") -> str:
         """Tool to get the database schema."""
         if not self.db_manager:
             return "Error: Database manager not initialized"
             
         try:
-            # Get all tables
-            tables_query = "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
-            tables_df = self.db_manager.execute_query(tables_query)
+            # Use DatabaseService with debug mode for agent operations
+            from src.database.db_service import DatabaseService
             
-            if tables_df is None or tables_df.empty:
-                return "No tables found in database"
+            # Get the full schema
+            schema = DatabaseService.get_full_schema(self.db_manager, debug_mode=True)
+            
+            if not schema:
+                return "No tables found in database or error fetching schema"
                 
+            # Format the result for the agent
             result = "Database Schema:\n"
             
-            # For each table, get its columns
-            for table in tables_df['table_name']:
-                columns_query = f"""
-                SELECT column_name, data_type 
-                FROM information_schema.columns 
-                WHERE table_schema = 'public' 
-                AND table_name = '{table}'
-                """
-                columns_df = self.db_manager.execute_query(columns_query)
-                
-                if columns_df is not None and not columns_df.empty:
-                    result += f"\nTable: {table}\n"
-                    for _, row in columns_df.iterrows():
-                        result += f"  - {row['column_name']} ({row['data_type']})\n"
+            for table, columns in schema.items():
+                result += f"\nTable: {table}\n"
+                for col in columns:
+                    result += f"  - {col['name']} ({col['type']})\n"
             
             return result
         except Exception as e:
             return f"Error fetching schema: {str(e)}"
 
     def initialize_agent(self, db_manager) -> bool:
-        """Initialize the agent with SQL tools."""
+        """Initialize the agent with SQL tools and chains."""
         try:
             if not self.llm:
                 st.error("Please initialize the LLM first")
@@ -157,9 +201,13 @@ class SQLAgent:
             # Define tools
             tools = [
                 Tool(
-                    name="execute_sql",
+                    name="execute_sql_query",
                     func=self.execute_sql_tool,
-                    description="Useful for when you need to execute a SQL query. Input should be a valid SQL query string without any parentheses or function call syntax."
+                    description="""Useful for when you need to execute a SQL query. 
+                    Input should be a raw SQL query WITHOUT any surrounding quotes or function call syntax.
+                    Example: SELECT * FROM table_name
+                    NOT: ```sql SELECT * FROM table_name``` or "SELECT * FROM table_name"
+                    """
                 ),
                 Tool(
                     name="get_schema",
@@ -168,7 +216,7 @@ class SQLAgent:
                 )
             ]
             
-            # Define prompt template
+            # Define prompt template for the agent
             prompt_template = """You are a SQL expert that helps users query databases. 
             
             When asked a question, think through what tables and columns you need to query, then use the provided tools to execute SQL queries and return the results.
@@ -177,9 +225,14 @@ class SQLAgent:
             
             {schema_context}
             
+            IMPORTANT SQL QUERY GUIDELINES:
+            1. ALWAYS quote column and table names with double quotes (e.g., "teamID" not teamID)
+            2. For string matching, put string literals in single quotes: WHERE name = 'example'
+            3. For aggregate functions like COUNT, AVG, SUM, etc., make sure to use an alias for readability
+            
             For your final answer, provide:
             1. A natural language explanation of the results
-            2. The exact SQL query you used
+            2. DO NOT include the SQL query in your answer - it will be displayed separately in the UI
             
             Tools:
             {tools}
@@ -193,7 +246,7 @@ class SQLAgent:
             Observation: the result of the action
             ... (this Thought/Action/Action Input/Observation can repeat N times)
             Thought: I now know the final answer
-            Final Answer: your final answer, with explanation and SQL query
+            Final Answer: your final answer with explanation ONLY - do not include the SQL query
             
             IMPORTANT: When using tools, you must provide ONLY the tool name without any parentheses or function call syntax. For example, use "get_schema" not "get_schema()".
             
@@ -214,8 +267,6 @@ class SQLAgent:
                 verbose=True,
                 return_intermediate_steps=True,
                 max_iterations=10,
-                # Avoid using newer parameters that might not be supported
-                # handle_parsing_errors=True,
             )
             
             st.success("SQL Agent initialized successfully!")
@@ -246,10 +297,10 @@ class SQLAgent:
         return None
 
     def process_query(self, query: str, schema: Optional[Dict[str, List[Dict[str, str]]]] = None) -> Optional[Dict[str, Any]]:
-        """Process a user query using the agent."""
+        """Process a user query using the agent"""
         try:
             if not self.agent_executor:
-                st.error("Please initialize the agent first")
+                st.error("Please initialize the SQL Agent first")
                 return None
             
             # Clear previous results
@@ -274,10 +325,10 @@ class SQLAgent:
                 st.session_state.debug_info.append("Using provided schema context")
             else:
                 input_dict["schema_context"] = ""
-            
-            # Run the agent
+
+            # Then, use the agent for additional context and execution
             try:
-                response = self.agent_executor(input_dict)
+                agent_response = self.agent_executor(input_dict)
             except Exception as agent_error:
                 st.error(f"Agent execution error: {str(agent_error)}")
                 if hasattr(agent_error, "__traceback__"):
@@ -295,8 +346,8 @@ class SQLAgent:
             sql_query = None
             
             # First try to find SQL in intermediate steps
-            if "intermediate_steps" in response:
-                for step in response["intermediate_steps"]:
+            if "intermediate_steps" in agent_response:
+                for step in agent_response["intermediate_steps"]:
                     if isinstance(step, tuple) and len(step) >= 2:
                         action = step[0]
                         if hasattr(action, "tool") and action.tool == "execute_sql":
@@ -305,19 +356,39 @@ class SQLAgent:
                                 break
             
             # If not found in steps, try to extract from final answer
-            if not sql_query and "output" in response:
-                sql_query = self.extract_sql_from_text(response["output"])
+            if not sql_query and "output" in agent_response:
+                sql_query = self.extract_sql_from_text(agent_response["output"])
             
             # Use last query from session state if still not found
             if not sql_query:
                 sql_query = st.session_state.get("last_query", "")
             
+            # Combine responses from both chain and agent
+            answer = ""
+            answer += agent_response.get("output", "No answer provided")
+            
+            # Remove common SQL explanations from the answer
+            sql_explanations = [
+                r"The SQL query used to obtain this information is:[\s\S]*?(?=\n\n|\Z)",
+                r"The SQL query I used is:[\s\S]*?(?=\n\n|\Z)",
+                r"Here's the SQL query I used:[\s\S]*?(?=\n\n|\Z)",
+                r"SQL query:[\s\S]*?(?=\n\n|\Z)",
+                r"```sql[\s\S]*?```"
+            ]
+            
+            for pattern in sql_explanations:
+                answer = re.sub(pattern, "", answer, flags=re.IGNORECASE)
+            
+            # Remove any double newlines resulting from the removals
+            answer = re.sub(r'\n\s*\n\s*\n', '\n\n', answer)
+            answer = answer.strip()
+            
             # Prepare the result
             result = {
-                "answer": response.get("output", "No answer provided"),
+                "answer": answer,
                 "sql": sql_query,
                 "result_df": st.session_state.get("last_query_result", None),
-                "intermediate_steps": response.get("intermediate_steps", []),
+                "intermediate_steps": agent_response.get("intermediate_steps", []),
                 "debug_info": st.session_state.debug_info
             }
             
@@ -326,83 +397,4 @@ class SQLAgent:
             st.error(f"Error processing query: {str(e)}")
             import traceback
             st.error(traceback.format_exc())
-            return None 
-
-    def direct_execute_query(self, sql_query: str) -> Optional[Dict[str, Any]]:
-        """Execute SQL query directly without using the agent."""
-        try:
-            # Clean the query
-            cleaned_query = self.clean_sql_query(sql_query)
-            if not cleaned_query:
-                return {
-                    "answer": "Could not execute query: Empty query after cleaning",
-                    "sql": sql_query,
-                    "result_df": None,
-                    "intermediate_steps": [],
-                    "debug_info": ["Empty query after cleaning"]
-                }
-                
-            # Execute the query - use silent mode to hide debug messages
-            df = self.db_manager.execute_query(cleaned_query, silent=True)
-            if df is None:
-                return {
-                    "answer": "Query executed but returned no results.",
-                    "sql": cleaned_query,
-                    "result_df": None,
-                    "intermediate_steps": [],
-                    "debug_info": ["Query returned no results"]
-                }
-                
-            # Prepare the result
-            return {
-                "answer": f"Query executed successfully, returned {len(df)} rows.",
-                "sql": cleaned_query,
-                "result_df": df,
-                "intermediate_steps": [],
-                "debug_info": []
-            }
-        except Exception as e:
-            st.error(f"Error executing direct query: {str(e)}")
-            import traceback
-            st.error(traceback.format_exc())
-            return {
-                "answer": f"Error executing query: {str(e)}",
-                "sql": sql_query,
-                "result_df": None,
-                "intermediate_steps": [],
-                "debug_info": [f"Error: {str(e)}"]
-            }
-    
-    def get_tables(self) -> Optional[Dict[str, Any]]:
-        """Get all tables in the database."""
-        try:
-            if not self.db_manager:
-                st.error("Database manager not initialized")
-                return None
-                
-            # Query for PostgreSQL
-            sql_query = "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
-            
-            # Create a custom response with silent mode instead of using direct_execute_query
-            cleaned_query = self.clean_sql_query(sql_query)
-            df = self.db_manager.execute_query(cleaned_query, silent=True)
-            
-            if df is None:
-                return {
-                    "answer": "No tables found in the database.",
-                    "sql": cleaned_query,
-                    "result_df": None,
-                    "intermediate_steps": [],
-                    "debug_info": []
-                }
-                
-            return {
-                "answer": f"Found {len(df)} tables in the database.",
-                "sql": cleaned_query,
-                "result_df": df,
-                "intermediate_steps": [],
-                "debug_info": []
-            }
-        except Exception as e:
-            st.error(f"Error getting tables: {str(e)}")
             return None 

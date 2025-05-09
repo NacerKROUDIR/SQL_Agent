@@ -1,9 +1,10 @@
 import streamlit as st
+from src.database.db_service import DatabaseService
 
 def update_sidebar_tables():
     """Update the sidebar tables session state"""
     if st.session_state.sql_agent.agent_executor:
-        st.session_state.tables_for_sidebar = st.session_state.sql_agent.get_tables()
+        st.session_state.tables_for_sidebar = DatabaseService.get_tables(st.session_state.db_manager, debug_mode=False)
     else:
         st.session_state.tables_for_sidebar = None
 
@@ -12,23 +13,14 @@ def get_full_schema():
     if not st.session_state.sql_agent.agent_executor:
         return None
     
-    schema = {}
-    if st.session_state.tables_for_sidebar and st.session_state.tables_for_sidebar.get("result_df") is not None:
-        tables = st.session_state.tables_for_sidebar["result_df"]["table_name"]
-        for table in tables:
-            columns_df = get_table_columns(table)
-            if columns_df is not None:
-                schema[table] = [
-                    {"name": row['column_name'], "type": row['data_type']} 
-                    for _, row in columns_df.iterrows()
-                ]
-    return schema
+    return DatabaseService.get_full_schema(st.session_state.db_manager, debug_mode=False)
 
 def get_table_columns(table_name):
     """Get columns for a specific table"""
     if not st.session_state.sql_agent.agent_executor:
         return None
-        
+    
+    # Create the SQL query directly to avoid debugging output
     columns_query = f"""
     SELECT column_name, data_type 
     FROM information_schema.columns 
@@ -37,8 +29,8 @@ def get_table_columns(table_name):
     ORDER BY ordinal_position
     """
     
-    # Execute query in silent mode
-    result = st.session_state.sql_agent.direct_execute_query(columns_query)
+    # Execute query with silent mode
+    result = DatabaseService.direct_execute_query(st.session_state.db_manager, columns_query, debug_mode=False)
     return result["result_df"] if result and result.get("result_df") is not None else None
 
 def show_tables():
@@ -47,7 +39,7 @@ def show_tables():
         st.error("Please initialize the SQL Agent first")
         return False
         
-    tables_result = st.session_state.sql_agent.get_tables()
+    tables_result = DatabaseService.get_tables(st.session_state.db_manager, debug_mode=False)
     if tables_result:
         st.write(tables_result["answer"])
         with st.expander("View SQL Query"):
