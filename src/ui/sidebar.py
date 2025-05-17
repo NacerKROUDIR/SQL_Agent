@@ -41,31 +41,33 @@ def render_llm_config():
         # Use the get_ollama_models function from session state
         st.session_state.ollama_models = st.session_state.get_ollama_models()
     
-    if st.session_state.ollama_models:
-        # Create display names for the dropdown
-        model_display_names = [get_model_display_name(model) for model in st.session_state.ollama_models]
-        selected_display_name = st.selectbox("Select Model", model_display_names)
-        
-        # Get the selected model details
-        selected_model = get_model_by_display_name(selected_display_name, st.session_state.ollama_models)
-        
-        # Show API key input for OpenAI models
-        if selected_model and selected_model["type"] == "openai":
-            st.session_state.openai_api_key = st.text_input(
-                "OpenAI API Key",
-                type="password",
-                value=st.session_state.openai_api_key
-            )
-        
-        if st.button("Initialize LLM"):
-            if st.session_state.sql_agent.initialize_llm(
-                selected_model["name"],
-                selected_model["type"],
-                st.session_state.openai_api_key if selected_model["type"] == "openai" else None
-            ):
-                st.session_state.sql_agent = st.session_state.sql_agent
-    else:
-        st.error("No models found. Please ensure Ollama is running.")
+    # Check if we have any Ollama models specifically
+    has_ollama_models = any(model["type"] == "ollama" for model in st.session_state.ollama_models)
+    if not has_ollama_models:
+        st.warning("Ollama models not found. Please ensure Ollama is running.")
+    
+    # Create display names for the dropdown
+    model_display_names = [get_model_display_name(model) for model in st.session_state.ollama_models]
+    selected_display_name = st.selectbox("Select Model", model_display_names)
+    
+    # Get the selected model details
+    selected_model = get_model_by_display_name(selected_display_name, st.session_state.ollama_models)
+    
+    # Show API key input for OpenAI models
+    if selected_model and selected_model["type"] == "openai":
+        st.session_state.openai_api_key = st.text_input(
+            "OpenAI API Key",
+            type="password",
+            value=st.session_state.openai_api_key
+        )
+    
+    if st.button("Initialize LLM"):
+        if st.session_state.sql_agent.initialize_llm(
+            selected_model["name"],
+            selected_model["type"],
+            st.session_state.openai_api_key if selected_model["type"] == "openai" else None
+        ):
+            st.session_state.sql_agent = st.session_state.sql_agent
 
 def render_agent_config():
     """Render SQL agent configuration section"""
